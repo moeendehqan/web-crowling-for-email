@@ -13,6 +13,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 lock = Lock()
 SAVE_INTERVAL = 40
 MAX_WORKERS = 40
+MAX_LINKS = 100_000   # 🔹 سقف لینک‌ها
 
 session = requests.Session()
 
@@ -31,7 +32,6 @@ def get_base_url(url: str) -> str:
 def full_url(link: str, base_url: str) -> str:
     url = normalize_url(urljoin(base_url, link))
     parsed = urlparse(url)
-    # پردازش لینک گوگل
     if "google." in parsed.netloc and parsed.path == "/url":
         qs = parse_qs(parsed.query)
         if "q" in qs:
@@ -69,6 +69,11 @@ pages_processed = 0
 
 # ---------------- Save functions ---------------- #
 def save_links():
+    global links
+    if len(links) > MAX_LINKS:  # 🔹 مدیریت حجم لینک‌ها
+        links = [l for l in links if l["a_crawl"] == 0]
+        print(f"⚠️ حجم لینک‌ها زیاد بود → فقط {len(links)} لینک باقیمانده ذخیره شد")
+
     with open("links.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["link", "a_crawl"])
         writer.writeheader()
@@ -108,13 +113,10 @@ def crawl_page(page_url: str):
             full = full_url(a['href'], page_url)
             if is_media_or_document(full):
                 continue
-            # 🔹 منطق لینک‌های گوگل
             if "google." in urlparse(page_url).netloc:
-                # فقط لینک‌های خارجی نسبت به گوگل
                 if "google." not in urlparse(full).netloc:
                     local_links.add(full)
             else:
-                # هر لینک دیگری
                 local_links.add(full)
 
         with lock:
@@ -142,16 +144,22 @@ def crawl_page(page_url: str):
     finally:
         mark_as_crawled(page_url)
 
-# ---------------- Run in Parallel ---------------- #
-to_crawl = [l["link"] for l in links if l["a_crawl"] == 0]
+# ---------------- Run in Loop ---------------- #
+while True:
+    to_crawl = [l["link"] for l in links if l["a_crawl"] == 0]
+    if not to_crawl:
+        break
 
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    futures = {executor.submit(crawl_page, url): url for url in to_crawl}
-    for future in as_completed(futures):
-        try:
-            future.result()
-        except Exception as e:
-            print(f"❌ خطای ناخواسته در {futures[future]}: {e}")
+    print(f"\n🚀 شروع دور جدید: {len(to_crawl)} لینک در صف")
 
-save_links()
-print(f"\n🚀 تمام شد! {sum(1 for l in links if l['a_crawl']==0)} لینک باقی مانده و {len(emails)} ایمیل ذخیره شد.")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(crawl_page, url): url for url in to_crawl}
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"❌ خطای ناخواسته در {futures[future]}: {e}")
+
+    save_links()
+
+print(f"\n🏁 کار تمام شد! {sum(1 for l in links if l['a_crawl']==0)} لینک باقی و {len(emails)} ایمیل ذخیره شد.")
