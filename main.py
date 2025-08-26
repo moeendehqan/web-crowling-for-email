@@ -1,144 +1,157 @@
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin, urlunparse
+from urllib.parse import urlparse, urljoin, urlunparse, parse_qs
 import urllib3
 import re
 import csv
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+lock = Lock()
+SAVE_INTERVAL = 40
+MAX_WORKERS = 40
+
+session = requests.Session()
 
 # ---------------- Utils ---------------- #
 def normalize_url(url: str) -> str:
     parsed = urlparse(url)
-    scheme = "https" if parsed.scheme in ["http", "https"] else parsed.scheme
+    scheme = "https" if parsed.scheme in ["http", "https"] else "http"
     path = parsed.path.replace("//", "/")
     return urlunparse((scheme, parsed.netloc.lower(), path, parsed.params, parsed.query, parsed.fragment))
-
 
 def get_base_url(url: str) -> str:
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
-    if domain.startswith("www."):
-        domain = domain[4:]
-    return domain
-
-
-def allow_url(url: str) -> bool:
-    disallow = {
-        'google.com', 'facebook.com', 'instagram.com', 'twitter.com',
-        'youtube.com', 'linkedin.com', 'pinterest.com', 'reddit.com',
-        'tumblr.com', 'yahoo.com', 'aparat.com', 'x.com', 't.me'
-    }
-    return get_base_url(url) not in disallow
-
+    return domain[4:] if domain.startswith("www.") else domain
 
 def full_url(link: str, base_url: str) -> str:
-    if not base_url.endswith("/"):
-        base_url += "/"
-    absolute_url = urljoin(base_url, link)
-    return normalize_url(absolute_url)
-
+    url = normalize_url(urljoin(base_url, link))
+    parsed = urlparse(url)
+    # پردازش لینک گوگل
+    if "google." in parsed.netloc and parsed.path == "/url":
+        qs = parse_qs(parsed.query)
+        if "q" in qs:
+            return normalize_url(qs["q"][0])
+    return url
 
 def extract_emails(text: str) -> set:
-    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    return set(re.findall(email_pattern, text))
-
+    return set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text))
 
 def is_media_or_document(url: str) -> bool:
-    """بررسی می‌کند که لینک به PDF، عکس یا ویدیو اشاره نکند."""
-    media_extensions = (
+    return urlparse(url).path.lower().endswith((
         ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg",
         ".mp4", ".mov", ".avi", ".mkv", ".webm"
-    )
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    return path.endswith(media_extensions)
-
+    ))
 
 # ---------------- Load existing data ---------------- #
-df_link = pd.read_excel('link.xlsx')
-df_link = df_link.dropna(subset=['link'])
+links = []
+seen_links = set()
+if os.path.exists("links.csv"):
+    with open("links.csv", "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            links.append({"link": row["link"], "a_crawl": int(row["a_crawl"])})
+            seen_links.add(row["link"])
 
 emails = set()
 if os.path.exists("emails.csv"):
     with open("emails.csv", "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        next(reader, None)  # رد کردن هدر
+        next(reader, None)
         for row in reader:
             emails.add(row[0].strip())
 
+pages_processed = 0
 
-# ---------------- Main Crawl ---------------- #
-new_links = set()
+# ---------------- Save functions ---------------- #
+def save_links():
+    with open("links.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["link", "a_crawl"])
+        writer.writeheader()
+        for l in links:
+            writer.writerow(l)
 
-for index, row in df_link.iterrows():
+def save_emails(new_emails):
+    with open("emails.csv", "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for email in new_emails:
+            writer.writerow([email])
+
+def mark_as_crawled(page_url: str):
+    with lock:
+        for l in links:
+            if l["link"] == page_url:
+                l["a_crawl"] = 1
+                break
+
+# ---------------- Crawl Function ---------------- #
+def crawl_page(page_url: str):
+    global pages_processed
+
+    if is_media_or_document(page_url):
+        mark_as_crawled(page_url)
+        return
+
     try:
-        page_url = row['link']
-        a_crawl = row['a_crawl']
-
-        if a_crawl == 1:
-            continue
-
-        print(f"\n🌐 در حال پردازش: {page_url}")
-        if is_media_or_document(page_url):
-            print(f"❌ {page_url} is media or document")
-            continue
-
-        try:
-            response = requests.get(page_url, verify=False, timeout=10)
-        except Exception as e:
-            print(f"❌ خطا در دریافت {page_url}: {e}")
-            continue
-
+        response = session.get(page_url, verify=False, timeout=6)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        found_links = [a['href'] for a in soup.find_all('a', href=True)]
 
-        # 🔎 استخراج ایمیل‌ها
-        page_emails = extract_emails(response.text)
-        for email in page_emails:
-            try:
-                if email not in emails:
-                    emails.add(email)
-                    print(f"📧 ایمیل جدید پیدا شد: {email}")
-            except Exception as e:
-                print(f"❌ خطا در اضافه کردن ایمیل {email}: {e}")
-                continue
+        local_emails = extract_emails(soup.get_text(" ", strip=True))
 
-        # 🔗 پردازش لینک‌ها
-        for raw_link in found_links:
-            try:
-                full = full_url(raw_link, page_url)
-                if not allow_url(full):
-                    continue
-                if is_media_or_document(full):
-                    continue  # رد کردن لینک‌های PDF، عکس و ویدیو
-                if full not in df_link['link'].values and full not in new_links:
-                    new_links.add(full)
-                    print(f"➕ لینک جدید اضافه شد: {full}")
-            except Exception as e:
-                print(f"❌ خطا در اضافه کردن لینک {full}: {e}")
+        local_links = set()
+        for a in soup.find_all('a', href=True):
+            full = full_url(a['href'], page_url)
+            if is_media_or_document(full):
                 continue
+            # 🔹 منطق لینک‌های گوگل
+            if "google." in urlparse(page_url).netloc:
+                # فقط لینک‌های خارجی نسبت به گوگل
+                if "google." not in urlparse(full).netloc:
+                    local_links.add(full)
+            else:
+                # هر لینک دیگری
+                local_links.add(full)
+
+        with lock:
+            new_emails = local_emails - emails
+            if new_emails:
+                emails.update(new_emails)
+                save_emails(new_emails)
+                print(f"📧 {len(new_emails)} ایمیل جدید")
+
+            for link in local_links:
+                if link not in seen_links:
+                    links.append({"link": link, "a_crawl": 0})
+                    seen_links.add(link)
+
+            pages_processed += 1
+            if pages_processed % SAVE_INTERVAL == 0:
+                save_links()
+                print(f"💾 ذخیره دوره‌ای ({pages_processed} صفحه).")
+
+        print(f"✅ {page_url} | {len(local_emails)} ایمیل، {len(local_links)} لینک")
+
     except Exception as e:
-        print(f"❌ خطا در پردازش {page_url}: {e}")
-        continue
+        print(f"❌ خطا در {page_url}: {e}")
 
-# بروزرسانی دیتافریم لینک‌ها
-df_link.loc[:, 'a_crawl'] = 1
-df_link = pd.concat(
-    [df_link, pd.DataFrame({'link': list(new_links), 'a_crawl': 0})],
-    ignore_index=True
-)
-df_link.to_excel('link.xlsx', index=False)
+    finally:
+        mark_as_crawled(page_url)
 
-# ذخیره ایمیل‌ها
-with open("emails.csv", "w", newline="", encoding="utf-8") as f:
-    writer = csv.writer(f)
-    writer.writerow(["email"])
-    for email in sorted(emails):
-        writer.writerow([email])
+# ---------------- Run in Parallel ---------------- #
+to_crawl = [l["link"] for l in links if l["a_crawl"] == 0]
 
-print(f"\n✅ {len(new_links)} لینک جدید پیدا شد.")
-print(f"📧 {len(emails)} ایمیل یونیک ذخیره شد (emails.csv).")
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = {executor.submit(crawl_page, url): url for url in to_crawl}
+    for future in as_completed(futures):
+        try:
+            future.result()
+        except Exception as e:
+            print(f"❌ خطای ناخواسته در {futures[future]}: {e}")
+
+save_links()
+print(f"\n🚀 تمام شد! {sum(1 for l in links if l['a_crawl']==0)} لینک باقی مانده و {len(emails)} ایمیل ذخیره شد.")
